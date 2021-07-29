@@ -1,165 +1,274 @@
 <?php
-	
-	namespace PagoEpayco\Payco\Controller;
-	
-class PaymentController extends \Magento\Framework\App\Action\Action {
 
-public function __construct(
-	\Magento\Framework\App\Action\Context $context,
+/**
+ * Module for payment provide by ePayco
+ * Copyright (C) 2017
+ *
+ * This file is part of EPayco/EPaycoPayment.
+ *
+ * EPayco/EPaycoPayment is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
 
-	\Magento\Checkout\Model\Session $checkoutSession,
-	\Magento\Sales\Model\OrderFactory $orderFactory,
-	\Magento\Quote\Model\QuoteManagement $quote_management,
-	\Magento\Checkout\Model\Cart $cart
-) {
-	
-	$this->checkoutSession = $checkoutSession;
-	$this->orderFactory = $orderFactory;
-	$this->quoteManagement = $quote_management;
-	$this->cart = $cart;
-	
-	parent::__construct($context);
-}
-	
+namespace PagoEpayco\Payco\Controller\Epayco;
 
 
-	public function execute(){}
+class Index extends \Magento\Framework\App\Action\Action
+{
 
- 
-	
-	public function responseAction($control = false)
+	protected $resultPageFactory;
+	protected $resultJsonFactory;
+	protected $checkoutSession;
+	protected $orderFactory;
+	protected $cartManagement;
+	protected $quote;
+	protected $resultRedirect;
+	protected $_curl;
+	protected $observer;
+
+	/**
+	 * Constructor
+	 *
+	 * @param \Magento\Framework\App\Action\Context  $context
+	 * @param \Magento\Framework\Json\Helper\Data $jsonHelper
+	 */
+	public function __construct(
+		\Magento\Framework\App\Action\Context $context,
+		\Magento\Framework\View\Result\PageFactory $resultPageFactory,
+		\Magento\Framework\Controller\Result\JsonFactory $resultJsonFactory,
+		\Magento\Checkout\Model\Session $checkoutSession,
+		\Magento\Sales\Model\OrderFactory $orderFactory,
+		\Magento\Quote\Api\CartManagementInterface $cartManagement,
+		\Magento\Quote\Model\Quote $quote,
+		\Magento\Framework\HTTP\Client\Curl $curl,
+		\Magento\Framework\App\Helper\Context $contextApp,
+		\Magento\Framework\App\Config\ScopeConfigInterface $scopeConfig,
+		\PagoEpayco\Payco\Controller\PaymentController $payment_controller,
+		\Magento\Sales\Api\OrderRepositoryInterface $orderRepository
+		//\Magento\Framework\Event\Observer $observer
+
+	) {
+		$this->resultPageFactory = $resultPageFactory;
+		$this->resultJsonFactory = $resultJsonFactory;
+		$this->checkoutSession = $checkoutSession;
+		$this->orderFactory = $orderFactory;
+		$this->cartManagement = $cartManagement;
+		$this->quote = $quote;
+		$this->_curl = $curl;
+		$this->contextApp = $contextApp;
+		$this->scopeConfig = $scopeConfig;
+		$this->paymentController = $payment_controller;
+		$this->orderRepository = $orderRepository;
+		//$this->observer = $observer;
+		parent::__construct($context);
+	}
+
+	/**
+	 * Execute view action
+	 *
+	 * @return \Magento\Framework\Controller\ResultInterface
+	 */
+	public function execute()
 	{
-		if(!$control){
-			return true;
-		} else{
-			$this->_redirect($this->_buildUrl('confirmation/index/index'));
-			$x_respuesta=$_POST['x_response'];
-			$x_cod_response=$_POST['x_cod_response'];
-			$x_transaction_id=$_POST['x_transaction_id'];
-			$x_approval_code=$_POST['x_approval_code'];
-			$x_id_invoice=$_POST['x_id_invoice'];
-			$x_ref_payco=$_POST['x_ref_payco'];
-			$x_response_reason_text=$_POST['x_response_reason_text'];
-			$order = Mage::getModel('sales/order')->loadByIncrementId($x_id_invoice);
-			
-			$order_comment = "";
-			
-			foreach($_POST as $key=>$value){
-				$order_comment .= "<br/>$key: $value";
-			}
-			if($order->getStatus()=='complete'){
-				echo 'Transacción ya procesada';
-				exit;
-			}
-			
-			if($x_respuesta=='Aceptada'  && $x_cod_response=='1'){
-				
-				$order->getPayment()->setTransactionId($x_ref_payco);
-				$order->getPayment()->registerCaptureNotification($_POST['x_amount'] );
-				$order->addStatusToHistory($order->getStatus(), $order_comment);
-				$order->save();
-				echo utf8_encode('Transacción Aceptada');
-				
-			} else {
-				
-				if($x_respuesta=='Pendiente'){
-					$order->addStatusToHistory('pending', $order_comment);
-					echo utf8_encode('Transacción Pendiente');
+
+		$result = $this->resultJsonFactory->create();
+		$storeScope = \Magento\Store\Model\ScopeInterface::SCOPE_STORE;
+		$urlRedirect = $this->scopeConfig->getValue('payment/epayco/payco_callback', $storeScope);
+
+		if (isset($_GET['ref_payco'])) {
+			$this->_curl->get("https://secure.epayco.co/validation/v1/reference/" . $_GET['ref_payco']);
+			$response = $this->_curl->getBody();
+			$dataTransaction = json_decode($response);
+
+			if (isset($dataTransaction) && isset($dataTransaction->success) && $dataTransaction->success) {
+
+				$objectManager = \Magento\Framework\App\ObjectManager::getInstance();
+
+				$orderId = (int)$dataTransaction->data->x_extra2;
+				$order = $objectManager->create('\Magento\Sales\Model\Order')->loadByAttribute('quote_id', $orderId);
+
+				$code = $dataTransaction->data->x_cod_response;
+
+				if ($code == 1) {
+					$order->setState("complete")->setStatus("complete");
+				} else if ($code == 3) {
+					$order->setState("pending")->setStatus("pending");
+				} else if ($code == 2 || $code == 6 || $code == 9 || $code == 10) {
+					$order->setState("canceled")->setStatus("canceled");
+				} else if ($code == 4) {
+					$order->setState("pending")->setStatus("pending");
+				} else if ($code == 12) {
+					$order->setState("fraud")->setStatus("fraud");
 				}
-				if($x_respuesta=='Rechazada' || $x_respuesta=='Fallida'){
-					$order = Mage::getModel('sales/order')->loadByIncrementId($x_id_invoice);
-					$order->cancel();
-					$order->addStatusToHistory($order->getStatus(), $order_comment);
+
+				try {
 					$order->save();
-					echo utf8_encode('Transacción Rechazada');
+				} catch (\Exception $e) {
+					if ($urlRedirect != '') {
+						return $this->resultRedirectFactory->create()->setUrl($urlRedirect);
+					} else {
+						return $this->resultRedirectFactory->create()->setUrl('/');
+					}
+				}
+
+				if ($urlRedirect != '') {
+					return $this->resultRedirectFactory->create()->setUrl($urlRedirect);
+				} else {
+					return $this->resultRedirectFactory->create()->setUrl('/');
+				}
+			} else {
+				if ($urlRedirect != '') {
+					return $this->resultRedirectFactory->create()->setUrl($urlRedirect);
+				} else {
+					return $this->resultRedirectFactory->create()->setUrl('/');
 				}
 			}
-			exit;
-			
-		
-		}
-		//echo '<pre>'.$this->_request.'</pre>';
-		//$this->_redirect('checkout/onepage/success');
-		/*$x_respuesta=$_POST['x_response'];
-        $x_cod_response=$_POST['x_cod_response'];
-        $x_transaction_id=$_POST['x_transaction_id'];
-        $x_approval_code=1;//$_POST['x_approval_code'];
-		
-		if($x_respuesta=='Aceptada' && $x_cod_response=='1' &&  $x_approval_code!='000000'){
-				$this->_redirect('checkout/onepage/success');
 		} else {
-				$this->_redirect('checkout/onepage/failure');
-		}*/
 
+			if (isset($_GET['x_ref_payco'])) {
+
+				//$data = $this->getRequest()->getParams();
+				$x_id_invoice   = $_GET['x_id_invoice'];
+				$p_cust_id_cliente = $this->scopeConfig->getValue('payment/epayco/payco_merchant', $storeScope);
+				$p_key             = $this->scopeConfig->getValue('payment/epayco/payco_key', $storeScope);
+				$x_ref_payco      = $_GET['x_ref_payco'];
+				$x_transaction_id = $_GET['x_transaction_id'];
+				$x_amount         = $_GET['x_amount'];
+				$x_currency_code  = $_GET['x_currency_code'];
+				$x_signature      = $_GET['x_signature'];
+				$x_response     = $_GET['x_response'];
+				$x_motivo       = $_GET['x_response_reason_text'];
+				$x_autorizacion = $_GET['x_approval_code'];
+				$signature = hash('sha256', $p_cust_id_cliente . '^' . $p_key . '^' . $x_ref_payco . '^' . $x_transaction_id . '^' . $x_amount . '^' . $x_currency_code);
+
+				if ($x_signature == $signature) {
+
+					$objectManager = \Magento\Framework\App\ObjectManager::getInstance();
+
+					$orderId = (int)$_GET['x_extra2'];
+					$order = $objectManager->create('\Magento\Sales\Model\Order')->loadByAttribute('quote_id', $orderId);
+
+					$x_cod_transaction_state = $_GET['x_cod_transaction_state'];
+
+					$code = (int)$x_cod_transaction_state;
+					if ($code == 1) {
+						$order->setState("complete")->setStatus("complete");
+					} else if ($code == 3) {
+						$order->setState("pending")->setStatus("pending");
+					} else if ($code == 2 || $code == 6 || $code == 9 || $code == 10) {
+						$order->setState("canceled")->setStatus("canceled");
+					} else if ($code == 4) {
+						$order->setState("pending")->setStatus("pending");
+					} else if ($code == 12) {
+						$order->setState("fraud")->setStatus("fraud");
+					}
+
+					try {
+						$order->save();
+					} catch (\Exception $e) {
+						return $result->setData('Error No se creo la orden');
+					}
+					return $result->setData('Orden confirmada');
+				} else {
+					return $result->setData('No se creo la orden');
+				}
+			} else {
+
+				// $data = json_decode(file_get_contents("php://input"));
+				$data = $this->getRequest()->getParams();
+				$p_cust_id_cliente = $this->scopeConfig->getValue('payment/epayco/payco_merchant', $storeScope);
+				$p_key             = $this->scopeConfig->getValue('payment/epayco/payco_key', $storeScope);
+				// $x_id_invoice   = $data->x_id_invoice;
+				// $x_ref_payco      = $data->x_ref_payco;
+				// $x_transaction_id = $data->x_transaction_id;
+				// $x_amount         = $data->x_amount ;
+				// $x_currency_code  = $data->x_currency_code;
+				// $x_signature      = $data->x_signature;
+				// $x_response     = $data->x_response;
+				// $x_motivo       = $data->x_response_reason_text;
+				// $x_autorizacion = $data->x_approval_code;
+				// $x_cod_transaction_state =$data->x_cod_transaction_state;
+				$x_id_invoice   = $data["x_id_invoice"];
+				$x_ref_payco      = $data["x_ref_payco"];
+				$x_transaction_id = $data["x_transaction_id"];
+				$x_amount         = $data["x_amount"];
+				$x_currency_code  = $data["x_currency_code"];
+				$x_signature      = $data["x_signature"];
+				$x_response     = $data["x_response"];
+				$x_motivo       = $data["x_response_reason_text"];
+				$x_autorizacion = $data["x_approval_code"];
+				$x_cod_transaction_state = $data["x_cod_transaction_state"];
+				$signature = hash('sha256', $p_cust_id_cliente . '^' . $p_key . '^' . $x_ref_payco . '^' . $x_transaction_id . '^' . $x_amount . '^' . $x_currency_code);
+				// var_dump($signature,$signature,$data["x_extra2"]);
+				// die();
+
+				if ($x_signature == $signature) {
+					$objectManager = \Magento\Framework\App\ObjectManager::getInstance();
+
+					$orderId = (int)$data["x_extra2"];
+					$order = $objectManager->create('\Magento\Sales\Model\Order')->loadByAttribute('quote_id', $orderId);
+
+					$code = (int)$x_cod_transaction_state;
+					if ($code == 1) {
+						$order->setState("complete")->setStatus("complete");
+					} else if ($code == 3) {
+						$order->setState("pending")->setStatus("pending");
+					} else if ($code == 2 || $code == 6 || $code == 9 || $code == 10) {
+						$order->setState("canceled")->setStatus("canceled");
+					} else if ($code == 4) {
+						$order->setState("pending")->setStatus("pending");
+					} else if ($code == 12) {
+						$order->setState("fraud")->setStatus("fraud");
+					}
+
+					try {
+						$order->save();
+					} catch (\Exception $e) {
+						return $result->setData('Error No se creo la orden');
+					}
+					return $result->setData('Orden confirmada_');
+				} else {
+					return $result->setData('No se creo la orden_');
+				}
+			}
+		}
 	}
-	
-	public function confirmAction()
+
+
+
+	public function getRealOrderId()
 	{
-		$x_respuesta=$_POST['x_response'];
-        $x_cod_response=$_POST['x_cod_response'];
-        $x_transaction_id=$_POST['x_transaction_id'];
-        $x_approval_code=$_POST['x_approval_code'];
-        $x_id_invoice=$_POST['x_id_invoice'];
-        $x_ref_payco=$_POST['x_ref_payco'];
-		$x_response_reason_text=$_POST['x_response_reason_text'];
-        $order = Mage::getModel('sales/order')->loadByIncrementId($x_id_invoice);
-       
-		$order_comment = "";
-
-		foreach($_POST as $key=>$value){
-			$order_comment .= "<br/>$key: $value";
-		}
-		if($order->getStatus()=='complete'){
-			echo 'Transacción ya procesada';
-			exit;
-		}
-
-		if($x_respuesta=='Aceptada'  && $x_cod_response=='1'){
-				
-				$order->getPayment()->setTransactionId($x_ref_payco);	
-				$order->getPayment()->registerCaptureNotification($_POST['x_amount'] );
-				$order->addStatusToHistory($order->getStatus(), $order_comment);
-				$order->save();
-				echo utf8_encode('Transacción Aceptada');
-                    
-		} else {
-			
-                if($x_respuesta=='Pendiente'){
-                	$order->addStatusToHistory('pending', $order_comment);
-                	echo utf8_encode('Transacción Pendiente');
-                }
-               	if($x_respuesta=='Rechazada' || $x_respuesta=='Fallida'){
-               		$order = Mage::getModel('sales/order')->loadByIncrementId($x_id_invoice);
-                	$order->cancel();
-                	$order->addStatusToHistory($order->getStatus(), $order_comment);
-                	$order->save();
-                	echo utf8_encode('Transacción Rechazada');
-               	} 
-		}
-		exit;
-
+		$lastorderId = $this->checkoutSession->getLastOrderId();
+		return $lastorderId;
 	}
-	
-	public function getOrderId(){
-		//$lastorderId = $this->checkoutSession->getLastOrderId();
-		//$order = $this->orderFactory->create()->loadByIncrementId($lastorderId);
-		//return $lastorderId+1;
-		
-		/**$this->checkoutSession->getQuote()->reserveOrderId();
-		$reservedOrderId = $this->checkoutSession->getQuote()->getReservedOrderId();
-		return $reservedOrderId+1;**/
-		
-//		$order = $this->checkoutSession->getLastRealOrder();
-//		$orderId=$order->getIncrementId();
-		
-		
-//		$objectManager = \Magento\Framework\App\ObjectManager::getInstance();
-//		$last_order_increment_id = $objectManager->create('\Magento\Sales\Model\Order')->getCollection()->getLastItem()->getIncrementId();
-//
-//		return $last_order_increment_id+1;
-		$carrito = $this->checkoutSession->getQuote()->getId();
-		return $carrito;
-	
+
+	public function getOrder()
+	{
+		if ($this->checkoutSession->getLastRealOrderId()) {
+			$order = $this->orderFactory->create()->loadByIncrementId($this->checkoutSession->getLastRealOrderId());
+			return $order;
+		}
+		return false;
 	}
-	
+
+	public function getShippingInfo()
+	{
+		$order = $this->getOrder();
+		if ($order) {
+			$address = $order->getShippingAddress();
+
+			return $address;
+		}
+		return false;
+	}
 }
